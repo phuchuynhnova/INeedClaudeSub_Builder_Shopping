@@ -140,26 +140,33 @@ def run(sql, *views):
         return con.execute(sql)
 
 
-# ts -> epoch milliseconds, NULL when bad. F3 values too big for BIGINT are NULL (they are
-# outside every window anyway). Calendar validity comes from TRY_CAST to DATE.
+# ts -> epoch milliseconds, NULL when bad. The strict regexes decide the FORM (digits only,
+# hours 00-23, minutes/seconds 00-59, offset range, exact 'Z'); strptime then converts and
+# rejects impossible calendar dates (Feb 30, Feb 29 outside leap years). F3 values too big
+# for BIGINT are NULL (they are outside every window anyway).
 con.execute(
     r"""
 CREATE OR REPLACE MACRO ts_ms(x) AS
   CASE
     WHEN x IS NULL THEN NULL
     WHEN regexp_full_match(x, '[0-9]+') THEN TRY_CAST(ltrim(x, '0') AS BIGINT)
-    WHEN regexp_full_match(x, '[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](Z|[+-]([01][0-9]|2[0-3]):[0-5][0-9])')
-         AND TRY_CAST(substr(x, 1, 10) AS DATE) IS NOT NULL THEN
-      (TRY_CAST(substr(x, 1, 10) AS DATE) - DATE '1970-01-01')::BIGINT * 86400000
-      + CAST(substr(x, 12, 2) AS BIGINT) * 3600000
-      + CAST(substr(x, 15, 2) AS BIGINT) * 60000
-      + CAST(substr(x, 18, 2) AS BIGINT) * 1000
-      - CASE WHEN substr(x, 20, 1) = 'Z' THEN 0
-             ELSE (CAST(substr(x, 21, 2) AS BIGINT) * 3600000 + CAST(substr(x, 24, 2) AS BIGINT) * 60000)
-                  * (CASE WHEN substr(x, 20, 1) = '+' THEN 1 ELSE -1 END)
-        END
+    WHEN regexp_full_match(x, '[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z')
+      THEN CAST(epoch(try_strptime(x, '%Y-%m-%dT%H:%M:%SZ')) * 1000 AS BIGINT)
+    WHEN regexp_full_match(x, '[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9][+-]([01][0-9]|2[0-3]):[0-5][0-9]')
+      THEN CAST(epoch(try_strptime(x, '%Y-%m-%dT%H:%M:%S%z')) * 1000 AS BIGINT)
     ELSE NULL
   END
+"""
+)
+
+# ingest_ts is always F1 (fixed width): skip the regexes, fall back to ts_ms if it is not.
+con.execute(
+    r"""
+CREATE OR REPLACE MACRO ing_ms(x) AS
+  coalesce(
+    CASE WHEN length(x) = 20 AND substr(x, 20, 1) = 'Z'
+         THEN CAST(epoch(try_strptime(x, '%Y-%m-%dT%H:%M:%SZ')) * 1000 AS BIGINT) END,
+    ts_ms(x))
 """
 )
 
@@ -213,35 +220,46 @@ src("events_raw", os.path.join(DATA, "events", "*.csv"), 7)
 # Per row: parse ts, decide validity (rules 3 and 4), then keep, per event_id, the row with the
 # smallest ingest_ts together with its verdict `ok`. A later valid copy never rescues an
 # invalid kept copy. Only valid rows carry their strings (uid, and pid for purchases).
-run(
-    f"""
+# The event_id is grouped by two independent 64-bit hashes (collision odds ~1e-23 per dataset).
+EV_ROWS = f"""
+    SELECT hash(f1) AS h1, hash(f1 || '|') AS h2, f2, f6, t, ing, pv,
+           coalesce(f2 IS NOT NULL AND t >= {WS} AND t < {WE}
+                    AND f5 IN ('view', 'cart', 'purchase') AND f6 IS NOT NULL
+                    AND (f5 <> 'purchase' OR pv BETWEEN 1 AND 10000000)
+                    AND ing - t <= {DAY}, false) AS ok
+    FROM (
+      SELECT f1, f2, f5, f6, ts_ms(f3) AS t, ing_ms(f4) AS ing,
+             CASE WHEN f5 = 'purchase'
+                  THEN CASE WHEN f7 IS NOT NULL AND regexp_full_match(f7, '[0-9]+')
+                            THEN TRY_CAST(ltrim(f7, '0') AS BIGINT) END
+                  ELSE 0 END AS pv
+      FROM events_raw WHERE f1 IS NOT NULL
+    )
+"""
+
+
+def ev_dedup(source):
+    return f"""
     CREATE TABLE ev_v AS
     SELECT r.uid AS uid, r.t AS t, r.pid AS pid, r.pv AS pv
     FROM (
-      SELECT f1 AS event_id,
-             arg_min(struct_pack(ok := ok, uid := CASE WHEN ok THEN f2 END, t := t,
+      SELECT arg_min(struct_pack(ok := ok, uid := CASE WHEN ok THEN f2 END, t := t,
                                  pid := CASE WHEN ok AND pv > 0 THEN f6 END, pv := pv), ing) AS r
-      FROM (
-        SELECT f1, f2, f6, t, ing, pv,
-               coalesce(f2 IS NOT NULL AND t >= {WS} AND t < {WE}
-                        AND f5 IN ('view', 'cart', 'purchase') AND f6 IS NOT NULL
-                        AND (f5 <> 'purchase' OR pv BETWEEN 1 AND 10000000)
-                        AND ing - t <= {DAY}, false) AS ok
-        FROM (
-          SELECT f1, f2, f5, f6, ts_ms(f3) AS t, ts_ms(f4) AS ing,
-                 CASE WHEN f5 = 'purchase'
-                      THEN CASE WHEN f7 IS NOT NULL AND regexp_full_match(f7, '[0-9]+')
-                                THEN TRY_CAST(ltrim(f7, '0') AS BIGINT) END
-                      ELSE 0 END AS pv
-          FROM events_raw WHERE f1 IS NOT NULL
-        )
-      )
-      GROUP BY f1
+      FROM {source}
+      GROUP BY h1, h2
     )
     WHERE r.ok
-    """,
-    "events_raw",
-)
+    """
+
+
+if os.environ.get("DIAG"):
+    # diagnostics: time the parse/validate step and the dedup step separately
+    run(f"CREATE TABLE ev_r AS {EV_ROWS}", "events_raw")
+    log("DIAG events parsed and validated per row")
+    con.execute(ev_dedup("ev_r"))
+    con.execute("DROP TABLE ev_r")
+else:
+    run(ev_dedup(f"({EV_ROWS})"), "events_raw")
 log("events deduped and validated")
 
 # 5. sessions. person key = hash of the person's name. The default RANGE frame gives events
