@@ -100,13 +100,23 @@ def src(view, pattern, n, slow=False):
     cols = ", ".join(f"'f{i}': 'VARCHAR'" for i in range(1, n + 1))
     sel = ", ".join(f"unq(f{i}) AS f{i}" for i in range(1, n + 1))
     if not slow:
-        ok = " AND ".join(f"qok(f{i})" for i in range(1, n + 1))
+        def fieldok(i):
+            return (f"(CASE WHEN x{i} IS NULL THEN true WHEN NOT contains(x{i}, '\"') THEN true "
+                    f"ELSE (length(x{i}) >= 2 AND starts_with(x{i}, '\"') AND ends_with(x{i}, '\"') "
+                    f"AND NOT contains(substr(x{i}, 2, length(x{i}) - 2), '\"')) END)")
+        xs = ", ".join(f"f{i} AS x{i}" for i in range(1, n + 1))
+        ok = " AND ".join(fieldok(i) for i in range(1, n + 1))
+        unq = ", ".join(
+            f"nullif(CASE WHEN starts_with(x{i}, '\"') THEN substr(x{i}, 2, length(x{i}) - 2) ELSE x{i} END, '') AS f{i}"
+            for i in range(1, n + 1)
+        )
         con.execute(
             f"""
             CREATE OR REPLACE VIEW {view} AS
-            SELECT {sel} FROM read_csv('{pattern}', header = true, columns = {{{cols}}},
+            SELECT {unq} FROM (
+              SELECT {xs} FROM read_csv('{pattern}', header = true, columns = {{{cols}}},
                 delim = ',', quote = '', escape = '', new_line = '\\n',
-                auto_detect = false, ignore_errors = true, parallel = true)
+                auto_detect = false, ignore_errors = true, parallel = true))
             WHERE {ok}
             """
         )
@@ -141,31 +151,33 @@ def run(sql, *views):
 
 
 # ts -> epoch milliseconds, NULL when bad. The strict regexes decide the FORM (digits only,
-# hours 00-23, minutes/seconds 00-59, offset range, exact 'Z'); strptime then converts and
-# rejects impossible calendar dates (Feb 30, Feb 29 outside leap years). F3 values too big
-# for BIGINT are NULL (they are outside every window anyway).
+# hours 00-23, minutes/seconds 00-59, offset range, exact 'Z'); the cast to TIMESTAMPTZ then
+# converts (the string carries its own zone) and rejects impossible calendar dates (Feb 30,
+# Feb 29 outside leap years). F3 values too big for BIGINT are NULL (they are outside every
+# window anyway). Dispatch on length first so most rows run a single regex.
 con.execute(
     r"""
 CREATE OR REPLACE MACRO ts_ms(x) AS
   CASE
     WHEN x IS NULL THEN NULL
+    WHEN length(x) = 20 THEN
+      CASE WHEN regexp_full_match(x, '[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z')
+           THEN epoch_ms(TRY_CAST(x AS TIMESTAMPTZ)) END
+    WHEN length(x) = 25 THEN
+      CASE WHEN regexp_full_match(x, '[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9][+-]([01][0-9]|2[0-3]):[0-5][0-9]')
+           THEN epoch_ms(TRY_CAST(x AS TIMESTAMPTZ)) END
     WHEN regexp_full_match(x, '[0-9]+') THEN TRY_CAST(ltrim(x, '0') AS BIGINT)
-    WHEN regexp_full_match(x, '[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z')
-      THEN CAST(epoch(try_strptime(x, '%Y-%m-%dT%H:%M:%SZ')) * 1000 AS BIGINT)
-    WHEN regexp_full_match(x, '[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9][+-]([01][0-9]|2[0-3]):[0-5][0-9]')
-      THEN CAST(epoch(try_strptime(x, '%Y-%m-%dT%H:%M:%S%z')) * 1000 AS BIGINT)
     ELSE NULL
   END
 """
 )
 
-# ingest_ts is always F1 (fixed width): skip the regexes, fall back to ts_ms if it is not.
+# ingest_ts is always F1 (fixed width): skip the regexes, fall back to ts_ms.
 con.execute(
     r"""
 CREATE OR REPLACE MACRO ing_ms(x) AS
   coalesce(
-    CASE WHEN length(x) = 20 AND substr(x, 20, 1) = 'Z'
-         THEN CAST(epoch(try_strptime(x, '%Y-%m-%dT%H:%M:%SZ')) * 1000 AS BIGINT) END,
+    CASE WHEN length(x) = 20 AND substr(x, 20, 1) = 'Z' THEN epoch_ms(TRY_CAST(x AS TIMESTAMPTZ)) END,
     ts_ms(x))
 """
 )
@@ -191,7 +203,7 @@ run(
 )
 con.execute("CREATE TABLE ids AS SELECT id, (row_number() OVER ()) - 1 AS code FROM (SELECT a AS id FROM lk UNION SELECT b FROM lk)")
 n_ids = con.execute("SELECT count(*) FROM ids").fetchone()[0]
-con.execute("CREATE TABLE lk_map (id VARCHAR, person VARCHAR)")
+con.execute("CREATE TABLE lk_map (idh UBIGINT, person VARCHAR, person_h UBIGINT)")
 if n_ids:
     ed = con.execute(
         "SELECT ia.code AS a, ib.code AS b FROM lk JOIN ids ia ON lk.a = ia.id JOIN ids ib ON lk.b = ib.id"
@@ -205,7 +217,7 @@ if n_ids:
     con.execute(
         """
         INSERT INTO lk_map
-        SELECT i.id, m.person
+        SELECT hash(i.id), m.person, hash(m.person)
         FROM ids i JOIN lab_df l ON i.code = l.code
         JOIN (SELECT l2.comp AS comp, min(i2.id) AS person
               FROM ids i2 JOIN lab_df l2 ON i2.code = l2.code GROUP BY l2.comp) m ON l.comp = m.comp
@@ -272,8 +284,8 @@ con.execute(
                 OVER (PARTITION BY ph ORDER BY t) AS INTEGER) AS sid
     FROM (
       SELECT ph, t, pid, pv, lag(t) OVER (PARTITION BY ph ORDER BY t) AS prev
-      FROM (SELECT hash(coalesce(m.person, v.uid)) AS ph, v.t AS t, v.pid AS pid, v.pv AS pv
-            FROM ev_v v LEFT JOIN lk_map m ON v.uid = m.id)
+      FROM (SELECT coalesce(m.person_h, v.uh) AS ph, v.t AS t, v.pid AS pid, v.pv AS pv
+            FROM (SELECT hash(uid) AS uh, t, pid, pv FROM ev_v) v LEFT JOIN lk_map m ON v.uh = m.idh)
     )
     """
 )
@@ -320,21 +332,20 @@ src("clicks_raw", os.path.join(DATA, "clicks", "*.csv"), 4)
 run(
     f"""
     CREATE TABLE clk_v AS
-    SELECT hash(coalesce(m.person, c.uid)) AS ph, c.t AS t, c.campaign_id AS campaign_id, c.click_id AS click_id
+    SELECT coalesce(m.person_h, c.uh) AS ph, c.t AS t, c.campaign_id AS campaign_id, c.click_id AS click_id
     FROM (
-      SELECT click_id, uid, campaign_id, ts_ms(ts) AS t FROM (
-        SELECT f1 AS click_id, any_value(f2) AS uid, any_value(f3) AS campaign_id, any_value(f4) AS ts
-        FROM clicks_raw
-        WHERE f1 IS NOT NULL
-        GROUP BY f1
-      )
+      SELECT f1 AS click_id, hash(f2) AS uh, f3 AS campaign_id, ts_ms(f4) AS t
+      FROM clicks_raw
+      WHERE f1 IS NOT NULL AND f2 IS NOT NULL
     ) c
     JOIN camp ON c.campaign_id = camp.campaign_id
-    LEFT JOIN lk_map m ON c.uid = m.id
-    WHERE c.uid IS NOT NULL AND c.t >= {WS - 7 * DAY} AND c.t < {WE}
+    LEFT JOIN lk_map m ON c.uh = m.idh
+    WHERE c.t >= {WS - 7 * DAY} AND c.t < {WE}
     """,
     "clicks_raw",
 )
+# NOTE: no dedup on click_id: copies are identical (rules), and the aggregations below
+# (one row per person and ts; merged intervals) are unaffected by identical copies.
 # credit: per (person, ts) the click with the smallest click_id (byte-wise) wins ties
 con.execute(
     """
@@ -343,7 +354,21 @@ con.execute(
     FROM clk_v GROUP BY ph, t
     """
 )
-con.execute("CREATE TABLE clk AS SELECT DISTINCT ph, campaign_id, t AS ts FROM clk_v")
+# merged 7-day windows per (person, campaign): a session is assisted by the campaign iff its
+# start lies in one of them. Windows are disjoint, so each (session, campaign) is counted once.
+con.execute(
+    f"""
+    CREATE TABLE iv AS
+    SELECT ph, campaign_id, min(t) AS a, max(t) + {7 * DAY} AS b FROM (
+      SELECT ph, campaign_id, t,
+             sum(CASE WHEN pe IS NULL OR t > pe THEN 1 ELSE 0 END) OVER (PARTITION BY ph, campaign_id ORDER BY t) AS g
+      FROM (SELECT ph, campaign_id, t,
+                   max(t + {7 * DAY}) OVER (PARTITION BY ph, campaign_id ORDER BY t
+                                            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS pe
+            FROM clk_v)
+    ) GROUP BY ph, campaign_id, g
+    """
+)
 con.execute("DROP TABLE clk_v")
 log("clicks ready")
 
@@ -362,13 +387,11 @@ con.execute(
 )
 # assists: every campaign with a valid click in [start - 7 days, start], once per session
 con.execute(
-    f"""
+    """
     CREATE TABLE asst AS
-    SELECT campaign_id, day, count(*)::BIGINT AS assisted_sessions FROM (
-      SELECT s.ph, s.sid, s.day, c.campaign_id
-      FROM sess s JOIN clk c ON s.ph = c.ph AND c.ts <= s.st AND c.ts >= s.st - {7 * DAY}
-      GROUP BY s.ph, s.sid, s.day, c.campaign_id
-    ) GROUP BY campaign_id, day
+    SELECT i.campaign_id AS campaign_id, s.day AS day, count(*)::BIGINT AS assisted_sessions
+    FROM sess s JOIN iv i ON s.ph = i.ph AND s.st >= i.a AND s.st <= i.b
+    GROUP BY 1, 2
     """
 )
 log("attribution done")
