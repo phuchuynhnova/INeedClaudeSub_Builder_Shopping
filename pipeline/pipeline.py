@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-Shopping Sessions: DuckDB pipeline (correctness-first version).
+Shopping Sessions: DuckDB pipeline, v2 (faster).
 
 Reads  $DATA_DIR    (default /data)
 Writes $OUTPUT_DIR  (default /output): user_daily/ and campaign_daily/ as Parquet
 Temp   $SCRATCH_DIR (default /scratch)
 
 Design notes
-- CSV files are read as one-column text lines (no quote handling by DuckDB), then each
-  line is validated with ONE regex that encodes the dialect of rules.md and split on ','.
-  This avoids DuckDB's own CSV repair / null / quote behaviour.
-- Linked IDs: connected components with scipy, person name = byte-wise smallest ID.
-- Sessions: window functions per person. Credit: ASOF join. Assists: range join.
+- CSVs are read with DuckDB's native parser into VARCHAR columns with quoting switched off.
+  Lines with the wrong field count are skipped by the parser (ignore_errors); quote rules of
+  rules.md (quotes only around a whole field) are checked in SQL (qok / unq).
+  If the native reader raises, the files are re-read as plain text lines and parsed by a
+  regex (slow path, always correct, used e.g. for files with a \\r).
+- Validity of every event row is decided BEFORE dedup, then the dedup keeps the row with the
+  smallest ingest_ts and its verdict: that is "dedup, then validate the kept copy".
+- Persons are keyed by a 64-bit hash of their name (smallest linked ID) in all big tables;
+  names are restored at the very end.
 """
 import json
 import os
@@ -61,40 +65,65 @@ def iso_ms(s):
 WS = iso_ms(manifest["window_start"])
 WE = iso_ms(manifest["window_end"])
 
-# ---------------------------------------------------------------- helpers
+# ---------------------------------------------------------------- sources
 
 FIELD = r'(?:"[^",]*"|[^",]*)'
-
-
-def row_regex(n):
-    """A whole line is well formed iff it has exactly n fields, each either unquoted without
-    a quote, or wrapped in quotes with no quote inside. No field holds a comma."""
-    return FIELD + "(?:," + FIELD + "){" + str(n - 1) + "}"
-
-
 VIEWS = {}
 
 
-def lines(view, pattern, slow=False):
-    """Expose the files matching `pattern` as one VARCHAR column `line` (header skipped).
-    Only \\n ends a line; DuckDB's own quote/escape handling is switched off.
-    Fast path: DuckDB's CSV reader with one column. Slow path (used only if the fast
-    reader rejects the files, e.g. because of a \\r): read whole files and split on \\n."""
-    VIEWS[view] = pattern
+def row_regex(n):
+    return FIELD + "(?:," + FIELD + "){" + str(n - 1) + "}"
+
+
+# qok: a field is acceptable iff it has no quote, or is wrapped in quotes with none inside.
+# unq: remove the wrapping quotes; an empty field (quoted or not) is NULL.
+con.execute(
+    """
+CREATE OR REPLACE MACRO qok(x) AS
+  (x IS NULL OR position('"' IN x) = 0
+   OR (length(x) >= 2 AND substr(x, 1, 1) = '"' AND substr(x, length(x), 1) = '"'
+       AND position('"' IN substr(x, 2, length(x) - 2)) = 0))
+"""
+)
+con.execute(
+    """
+CREATE OR REPLACE MACRO unq(x) AS
+  CASE WHEN x IS NOT NULL AND substr(x, 1, 1) = '"' THEN nullif(substr(x, 2, length(x) - 2), '') ELSE x END
+"""
+)
+
+
+def src(view, pattern, n, slow=False):
+    """View `view` with columns f1..fn: the well-formed lines of the files matching `pattern`,
+    quotes removed, empty fields NULL."""
+    VIEWS[view] = (pattern, n)
+    cols = ", ".join(f"'f{i}': 'VARCHAR'" for i in range(1, n + 1))
+    sel = ", ".join(f"unq(f{i}) AS f{i}" for i in range(1, n + 1))
     if not slow:
+        ok = " AND ".join(f"qok(f{i})" for i in range(1, n + 1))
         con.execute(
             f"""
             CREATE OR REPLACE VIEW {view} AS
-            SELECT line FROM read_csv('{pattern}', header = true, columns = {{'line': 'VARCHAR'}},
-                delim = '\x01', quote = '', escape = '', new_line = '\\n',
-                auto_detect = false, parallel = true)
+            SELECT {sel} FROM read_csv('{pattern}', header = true, columns = {{{cols}}},
+                delim = ',', quote = '', escape = '', new_line = '\\n',
+                auto_detect = false, ignore_errors = true, parallel = true)
+            WHERE {ok}
             """
         )
     else:
         con.execute(
             f"""
-            CREATE OR REPLACE VIEW {view} AS
+            CREATE OR REPLACE VIEW {view}__lines AS
             SELECT unnest(string_split(content, chr(10))[2:]) AS line FROM read_text('{pattern}')
+            """
+        )
+        pick = ", ".join(f"nullif(trim(f[{i}], '\"'), '') AS f{i}" for i in range(1, n + 1))
+        con.execute(
+            f"""
+            CREATE OR REPLACE VIEW {view} AS
+            SELECT {pick}
+            FROM (SELECT string_split(line, ',') AS f FROM {view}__lines
+                  WHERE regexp_full_match(line, '{row_regex(n)}'))
             """
         )
 
@@ -104,21 +133,11 @@ def run(sql, *views):
     slow path and run it again."""
     try:
         return con.execute(sql)
-    except duckdb.InvalidInputException as error:
+    except duckdb.Error as error:
         log(f"fast CSV path failed ({str(error).splitlines()[0]}); using the slow line reader")
         for v in views:
-            lines(v, VIEWS[v], slow=True)
+            src(v, *VIEWS[v], slow=True)
         return con.execute(sql)
-
-
-def parsed(view, n):
-    """Columns f1..fn of the well-formed lines of `view`; quotes removed, empty -> NULL."""
-    cols = ", ".join(f"nullif(trim(f[{i}], '\"'), '') AS f{i}" for i in range(1, n + 1))
-    return f"""
-        SELECT {cols}
-        FROM (SELECT string_split(line, ',') AS f FROM {view}
-              WHERE regexp_full_match(line, '{row_regex(n)}'))
-    """
 
 
 # ts -> epoch milliseconds, NULL when bad. F3 values too big for BIGINT are NULL (they are
@@ -146,19 +165,19 @@ CREATE OR REPLACE MACRO ts_ms(x) AS
 
 # ---------------------------------------------------------------- small tables
 
-lines("products_raw", os.path.join(DATA, "products.csv"))
-lines("campaigns_raw", os.path.join(DATA, "campaigns.csv"))
-run(f"CREATE TABLE prod AS SELECT f1 AS product_id, f2 AS category FROM ({parsed('products_raw', 2)}) WHERE f1 IS NOT NULL", "products_raw")
-run(f"CREATE TABLE camp AS SELECT f1 AS campaign_id, f2 AS channel FROM ({parsed('campaigns_raw', 2)}) WHERE f1 IS NOT NULL", "campaigns_raw")
+src("products_raw", os.path.join(DATA, "products.csv"), 2)
+src("campaigns_raw", os.path.join(DATA, "campaigns.csv"), 2)
+run("CREATE TABLE prod AS SELECT f1 AS product_id, f2 AS category FROM products_raw WHERE f1 IS NOT NULL", "products_raw")
+run("CREATE TABLE camp AS SELECT f1 AS campaign_id, f2 AS channel FROM campaigns_raw WHERE f1 IS NOT NULL", "campaigns_raw")
 
 # ---------------------------------------------------------------- linked IDs
 
-lines("links_raw", os.path.join(DATA, "links", "*.csv"))
+src("links_raw", os.path.join(DATA, "links", "*.csv"), 2)
 run(
-    f"""
+    """
     CREATE TABLE lk AS
     SELECT DISTINCT least(f1, f2) AS a, greatest(f1, f2) AS b
-    FROM ({parsed('links_raw', 2)})
+    FROM links_raw
     WHERE f1 IS NOT NULL AND f2 IS NOT NULL AND f1 <> f2
     """,
     "links_raw",
@@ -190,71 +209,73 @@ log(f"links done: {n_ids} linked ids")
 
 # ---------------------------------------------------------------- events
 
-lines("events_raw", os.path.join(DATA, "events", "*.csv"))
-# 2. dedup on event_id, keeping the copy with the smallest ingest_ts. ingest_ts is always
-#    F1 (fixed width), so comparing the strings compares the instants.
+src("events_raw", os.path.join(DATA, "events", "*.csv"), 7)
+# Per row: parse ts, decide validity (rules 3 and 4), then keep, per event_id, the row with the
+# smallest ingest_ts together with its verdict `ok`. A later valid copy never rescues an
+# invalid kept copy. Only valid rows carry their strings (uid, and pid for purchases).
 run(
     f"""
-    CREATE TABLE ev_k AS
-    SELECT f1 AS event_id,
-           arg_min(struct_pack(uid := f2, ts := f3, ing := f4, et := f5, pid := f6, pr := f7), f4) AS r
-    FROM ({parsed('events_raw', 7)})
-    WHERE f1 IS NOT NULL
-    GROUP BY f1
+    CREATE TABLE ev_v AS
+    SELECT r.uid AS uid, r.t AS t, r.pid AS pid, r.pv AS pv
+    FROM (
+      SELECT f1 AS event_id,
+             arg_min(struct_pack(ok := ok, uid := CASE WHEN ok THEN f2 END, t := t,
+                                 pid := CASE WHEN ok AND pv > 0 THEN f6 END, pv := pv), ing) AS r
+      FROM (
+        SELECT f1, f2, f6, t, ing, pv,
+               coalesce(f2 IS NOT NULL AND t >= {WS} AND t < {WE}
+                        AND f5 IN ('view', 'cart', 'purchase') AND f6 IS NOT NULL
+                        AND (f5 <> 'purchase' OR pv BETWEEN 1 AND 10000000)
+                        AND ing - t <= {DAY}, false) AS ok
+        FROM (
+          SELECT f1, f2, f5, f6, ts_ms(f3) AS t, ts_ms(f4) AS ing,
+                 CASE WHEN f5 = 'purchase'
+                      THEN CASE WHEN f7 IS NOT NULL AND regexp_full_match(f7, '[0-9]+')
+                                THEN TRY_CAST(ltrim(f7, '0') AS BIGINT) END
+                      ELSE 0 END AS pv
+          FROM events_raw WHERE f1 IS NOT NULL
+        )
+      )
+      GROUP BY f1
+    )
+    WHERE r.ok
     """,
     "events_raw",
 )
-log("events deduped")
-# 3. validate the kept copy, 4. drop late events
-con.execute(
-    f"""
-    CREATE TABLE ev_v AS
-    SELECT uid, t, pid, pv FROM (
-      SELECT r.uid AS uid, ts_ms(r.ts) AS t, ts_ms(r.ing) AS ing, r.et AS et, r.pid AS pid,
-             CASE WHEN r.et = 'purchase'
-                  THEN CASE WHEN r.pr IS NOT NULL AND regexp_full_match(r.pr, '[0-9]+')
-                            THEN TRY_CAST(ltrim(r.pr, '0') AS BIGINT) END
-                  ELSE 0 END AS pv
-      FROM ev_k
-    )
-    WHERE uid IS NOT NULL AND t >= {WS} AND t < {WE}
-      AND et IN ('view', 'cart', 'purchase') AND pid IS NOT NULL
-      AND (et <> 'purchase' OR pv BETWEEN 1 AND 10000000)
-      AND ing - t <= {DAY}
-    """
-)
-con.execute("DROP TABLE ev_k")
-log("events validated")
+log("events deduped and validated")
 
-# link every event to its person
-con.execute(
-    """
-    CREATE TABLE ev_p AS
-    SELECT coalesce(m.person, v.uid) AS person, v.t AS t, v.pid AS pid, v.pv AS pv
-    FROM ev_v v LEFT JOIN lk_map m ON v.uid = m.id
-    """
-)
-con.execute("DROP TABLE ev_v")
-
-# 5. sessions. The default RANGE frame gives events with equal ts the same running sum, so
-#    they always share a session whatever order they are read in.
+# 5. sessions. person key = hash of the person's name. The default RANGE frame gives events
+#    with equal ts the same running sum, so they always share a session.
 con.execute(
     """
     CREATE TABLE ev_s AS
-    SELECT person, t, pid, pv,
-           sum(CASE WHEN prev IS NULL OR t - prev > 1800000 THEN 1 ELSE 0 END)
-               OVER (PARTITION BY person ORDER BY t) AS sid
-    FROM (SELECT person, t, pid, pv, lag(t) OVER (PARTITION BY person ORDER BY t) AS prev FROM ev_p)
+    SELECT ph, t, pid, pv,
+           CAST(sum(CASE WHEN prev IS NULL OR t - prev > 1800000 THEN 1 ELSE 0 END)
+                OVER (PARTITION BY ph ORDER BY t) AS INTEGER) AS sid
+    FROM (
+      SELECT ph, t, pid, pv, lag(t) OVER (PARTITION BY ph ORDER BY t) AS prev
+      FROM (SELECT hash(coalesce(m.person, v.uid)) AS ph, v.t AS t, v.pid AS pid, v.pv AS pv
+            FROM ev_v v LEFT JOIN lk_map m ON v.uid = m.id)
+    )
     """
 )
-con.execute("DROP TABLE ev_p")
+# names for the person hashes: every person is either a linked person or an unlinked ID
+con.execute(
+    """
+    CREATE TABLE names AS
+    SELECT hash(name) AS h, any_value(name) AS name
+    FROM (SELECT person AS name FROM lk_map UNION ALL SELECT DISTINCT uid FROM ev_v)
+    GROUP BY 1
+    """
+)
+con.execute("DROP TABLE ev_v")
 # 6. one row per session: start, events, revenue, UTC day of the start
 con.execute(
     """
     CREATE TABLE sess AS
-    SELECT person, sid, min(t) AS st, count(*)::BIGINT AS n, sum(pv)::BIGINT AS rev,
+    SELECT ph, sid, min(t) AS st, count(*)::BIGINT AS n, sum(pv)::BIGINT AS rev,
            (DATE '1970-01-01' + CAST(min(t) // 86400000 AS INTEGER)) AS day
-    FROM ev_s GROUP BY person, sid
+    FROM ev_s GROUP BY ph, sid
     """
 )
 log("sessions built")
@@ -263,29 +284,29 @@ log("sessions built")
 con.execute(
     """
     CREATE TABLE top_cat AS
-    SELECT person, day, cat FROM (
-      SELECT s.person AS person, s.day AS day, coalesce(p.category, 'unknown') AS cat, sum(e.pv) AS v
-      FROM (SELECT person, sid, pid, pv FROM ev_s WHERE pv > 0) e
-      JOIN sess s ON e.person = s.person AND e.sid = s.sid
+    SELECT ph, day, cat FROM (
+      SELECT s.ph AS ph, s.day AS day, coalesce(p.category, 'unknown') AS cat, sum(e.pv) AS v
+      FROM (SELECT ph, sid, pid, pv FROM ev_s WHERE pv > 0) e
+      JOIN sess s ON e.ph = s.ph AND e.sid = s.sid
       LEFT JOIN prod p ON e.pid = p.product_id
-      GROUP BY s.person, s.day, coalesce(p.category, 'unknown')
+      GROUP BY s.ph, s.day, coalesce(p.category, 'unknown')
     )
-    QUALIFY row_number() OVER (PARTITION BY person, day ORDER BY v DESC, cat ASC) = 1
+    QUALIFY row_number() OVER (PARTITION BY ph, day ORDER BY v DESC, cat ASC) = 1
     """
 )
 con.execute("DROP TABLE ev_s")
 
 # ---------------------------------------------------------------- clicks
 
-lines("clicks_raw", os.path.join(DATA, "clicks", "*.csv"))
+src("clicks_raw", os.path.join(DATA, "clicks", "*.csv"), 4)
 run(
     f"""
     CREATE TABLE clk_v AS
-    SELECT coalesce(m.person, c.uid) AS person, c.t AS t, c.campaign_id AS campaign_id, c.click_id AS click_id
+    SELECT hash(coalesce(m.person, c.uid)) AS ph, c.t AS t, c.campaign_id AS campaign_id, c.click_id AS click_id
     FROM (
       SELECT click_id, uid, campaign_id, ts_ms(ts) AS t FROM (
         SELECT f1 AS click_id, any_value(f2) AS uid, any_value(f3) AS campaign_id, any_value(f4) AS ts
-        FROM ({parsed('clicks_raw', 4)})
+        FROM clicks_raw
         WHERE f1 IS NOT NULL
         GROUP BY f1
       )
@@ -300,11 +321,11 @@ run(
 con.execute(
     """
     CREATE TABLE cu AS
-    SELECT person, t AS ts, arg_min(campaign_id, click_id) AS campaign_id
-    FROM clk_v GROUP BY person, t
+    SELECT ph, t AS ts, arg_min(campaign_id, click_id) AS campaign_id
+    FROM clk_v GROUP BY ph, t
     """
 )
-con.execute("CREATE TABLE clk AS SELECT DISTINCT person, campaign_id, t AS ts FROM clk_v")
+con.execute("CREATE TABLE clk AS SELECT DISTINCT ph, campaign_id, t AS ts FROM clk_v")
 con.execute("DROP TABLE clk_v")
 log("clicks ready")
 
@@ -317,7 +338,7 @@ con.execute(
            count(*)::BIGINT AS sessions,
            (count(*) FILTER (WHERE s.rev > 0))::BIGINT AS purchasing_sessions,
            sum(s.rev)::BIGINT AS revenue_cents
-    FROM sess s ASOF LEFT JOIN cu c ON s.person = c.person AND s.st >= c.ts
+    FROM sess s ASOF LEFT JOIN cu c ON s.ph = c.ph AND s.st >= c.ts
     GROUP BY 1, 2
     """
 )
@@ -326,9 +347,9 @@ con.execute(
     f"""
     CREATE TABLE asst AS
     SELECT campaign_id, day, count(*)::BIGINT AS assisted_sessions FROM (
-      SELECT s.person, s.sid, s.day, c.campaign_id
-      FROM sess s JOIN clk c ON s.person = c.person AND c.ts <= s.st AND c.ts >= s.st - {7 * DAY}
-      GROUP BY s.person, s.sid, s.day, c.campaign_id
+      SELECT s.ph, s.sid, s.day, c.campaign_id
+      FROM sess s JOIN clk c ON s.ph = c.ph AND c.ts <= s.st AND c.ts >= s.st - {7 * DAY}
+      GROUP BY s.ph, s.sid, s.day, c.campaign_id
     ) GROUP BY campaign_id, day
     """
 )
@@ -341,11 +362,12 @@ os.makedirs(os.path.join(OUT, "campaign_daily"), exist_ok=True)
 con.execute(
     f"""
     COPY (
-      SELECT u.person AS user_id, u.day AS day, u.sessions AS sessions, u.events AS events,
+      SELECT nm.name AS user_id, u.day AS day, u.sessions AS sessions, u.events AS events,
              u.revenue_cents AS revenue_cents, t.cat AS top_category
-      FROM (SELECT person, day, count(*)::BIGINT AS sessions, sum(n)::BIGINT AS events, sum(rev)::BIGINT AS revenue_cents
-            FROM sess GROUP BY person, day) u
-      LEFT JOIN top_cat t ON u.person = t.person AND u.day = t.day
+      FROM (SELECT ph, day, count(*)::BIGINT AS sessions, sum(n)::BIGINT AS events, sum(rev)::BIGINT AS revenue_cents
+            FROM sess GROUP BY ph, day) u
+      JOIN names nm ON u.ph = nm.h
+      LEFT JOIN top_cat t ON u.ph = t.ph AND u.day = t.day
     ) TO '{os.path.join(OUT, "user_daily", "part-0.parquet")}' (FORMAT parquet)
     """
 )
